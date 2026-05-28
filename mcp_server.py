@@ -13,6 +13,7 @@ from authsec_sdk.runtime.metadata import (
     build_www_authenticate,
 )
 import json
+import os
 import uvicorn
 from dotenv import load_dotenv
 
@@ -162,4 +163,5 @@ if __name__ == "__main__":
     protected_mcp = AuthSecMiddleware(mcp.streamable_http_app(), rt, mcp_path="/mcp")
     app.mount("/mcp", protected_mcp)
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
