@@ -1,27 +1,50 @@
 from datetime import datetime, timezone
-from mcp.server.fastmcp import FastMCP
-from starlette.middleware.cors import CORSMiddleware
-import uvicorn
+from authsec_sdk import run_mcp_server_with_oauth, protected_by_AuthSec
+import os
+import sys
+from dotenv import load_dotenv
 
-mcp = FastMCP("Simple MCP Server",transport_security={"enable_dns_rebinding_protection": False})
+load_dotenv()
 
-@mcp.tool()
-def add_numbers(a: int, b: int) -> int:
+@protected_by_AuthSec(
+    "add_numbers",
+    scopes=["read"],
+    description="Add two integers and return the sum.",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "a": {"type": "integer"},
+            "b": {"type": "integer"},
+        },
+        "required": ["a", "b"],
+    },
+)
+async def add_numbers(arguments: dict) -> int:
     """Add two integers and return the sum."""
-    return a + b
+    return arguments["a"] + arguments["b"]
 
-@mcp.tool()
-def get_time() -> str:
+
+@protected_by_AuthSec(
+    "get_time",
+    scopes=["read"],
+    description="Get the current server time (UTC, ISO 8601).",
+    inputSchema={"type": "object", "properties": {}},
+)
+async def get_time(arguments: dict) -> str:
     """Get the current server time (UTC, ISO 8601)."""
     return datetime.now(timezone.utc).isoformat()
 
+
 if __name__ == "__main__":
-    app = mcp.streamable_http_app()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],            # lock this down in production
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["mcp-session-id"],
+    client_id = (
+        os.getenv("AUTHSEC_CLIENT_ID")
+        or os.getenv("AUTHSEC_INTROSPECTION_CLIENT_ID")
+        or ""
     )
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    run_mcp_server_with_oauth(
+        sys.modules[__name__],
+        client_id=client_id,
+        app_name="Mcp server -1",
+        host="0.0.0.0",
+        port=8080,
+    )
