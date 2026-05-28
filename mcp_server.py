@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import Response
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +20,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── MCP tools ────────────────────────────────────────────────────────────────
+
 mcp = FastMCP("Simple MCP Server")
 
 
@@ -34,16 +37,23 @@ def get_time() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class AuthSecMiddleware:
-    """ASGI middleware: validates bearer tokens and enforces tool policy for /mcp."""
+# ── AuthSec runtime (module-level so Railway can also use uvicorn mcp_server:app) ──
 
-    def __init__(self, app, runtime: Runtime, mcp_path: str = "/mcp"):
+cfg = from_env()
+rt = Runtime(cfg)
+
+
+# ── ASGI middleware ──────────────────────────────────────────────────────────
+
+class AuthSecMiddleware:
+    """Validates bearer tokens and enforces tool policy for /mcp requests."""
+
+    def __init__(self, app, runtime: Runtime):
         self.app = app
         self.rt = runtime
-        self.mcp_path = mcp_path
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope["path"].startswith(self.mcp_path):
+        if scope["type"] != "http" or scope.get("path", "") != "/mcp":
             await self.app(scope, receive, send)
             return
 
@@ -66,7 +76,6 @@ class AuthSecMiddleware:
 
         scope.setdefault("state", {})["authsec_principal"] = principal
 
-        # For POST requests, buffer the body to check tool name before forwarding.
         if scope["method"] == "POST":
             first = await receive()
             body = first.get("body", b"")
@@ -77,15 +86,14 @@ class AuthSecMiddleware:
                 if isinstance(payload, dict) and payload.get("method") == "tools/call":
                     tool_name = (payload.get("params") or {}).get("name", "")
                     if tool_name:
-                        try:
-                            await self.rt.authorize_tool(principal, tool_name)
-                        except InsufficientScopeError as e:
-                            await self._send_insufficient_scope(send, e)
-                            return
-                        except PolicyUnavailableError as e:
-                            await self._send_error(send, 503, "policy_unavailable", str(e))
-                            return
-            except (json.JSONDecodeError, Exception):
+                        await self.rt.authorize_tool(principal, tool_name)
+            except InsufficientScopeError as e:
+                await self._send_insufficient_scope(send, e)
+                return
+            except PolicyUnavailableError as e:
+                await self._send_error(send, 503, "policy_unavailable", str(e))
+                return
+            except Exception:
                 pass
 
             replayed = False
@@ -102,27 +110,19 @@ class AuthSecMiddleware:
             await self.app(scope, receive, send)
 
     async def _send_error(self, send, status: int, error: str, description: str):
-        www_auth = build_www_authenticate(
-            self.rt.cfg, error=error, error_description=description
-        )
+        www_auth = build_www_authenticate(self.rt.cfg, error=error, error_description=description)
         body = json.dumps({"error": error, "error_description": description}).encode()
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"www-authenticate", www_auth.encode()),
-            ],
-        })
+        await send({"type": "http.response.start", "status": status, "headers": [
+            (b"content-type", b"application/json"),
+            (b"www-authenticate", www_auth.encode()),
+        ]})
         await send({"type": "http.response.body", "body": body})
 
     async def _send_insufficient_scope(self, send, err: InsufficientScopeError):
-        scope_str = " ".join(err.required)
         www_auth = build_www_authenticate(
-            self.rt.cfg,
-            error="insufficient_scope",
+            self.rt.cfg, error="insufficient_scope",
             error_description=f"tool {err.tool!r} requires {err.required!r}",
-            scope=scope_str,
+            scope=" ".join(err.required),
         )
         body = json.dumps({
             "error": "insufficient_scope",
@@ -130,38 +130,36 @@ class AuthSecMiddleware:
             "tool": err.tool,
             "required_scopes": err.required,
         }).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 403,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"www-authenticate", www_auth.encode()),
-            ],
-        })
+        await send({"type": "http.response.start", "status": 403, "headers": [
+            (b"content-type", b"application/json"),
+            (b"www-authenticate", www_auth.encode()),
+        ]})
         await send({"type": "http.response.body", "body": body})
 
 
-if __name__ == "__main__":
-    cfg = from_env()
-    rt = Runtime(cfg)
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
-    app = FastAPI()
-
-    @app.on_event("startup")
-    async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
         await rt.startup()
+    except Exception as e:
+        print(f"[authsec] startup warning (non-fatal): {e}")
+    yield
 
-    # RFC 9728 protected-resource metadata endpoint
-    metadata_path = build_resource_metadata_path(cfg.resource_uri)
 
-    @app.get(metadata_path)
-    async def metadata_endpoint():
-        body, headers = metadata_json_response(rt.cfg)
-        return Response(content=body, media_type="application/json", headers=headers)
+app = FastAPI(lifespan=lifespan)
 
-    # Mount MCP under /mcp, wrapped with AuthSec token validation
-    protected_mcp = AuthSecMiddleware(mcp.streamable_http_app(), rt, mcp_path="/mcp")
-    app.mount("/mcp", protected_mcp)
+# RFC 9728 metadata — must be registered before the root mount
+@app.get(build_resource_metadata_path(cfg.resource_uri))
+async def metadata_endpoint():
+    body, headers = metadata_json_response(rt.cfg)
+    return Response(content=body, media_type="application/json", headers=headers)
 
+# Mount MCP app at root so the path is NOT stripped — MCP handles /mcp internally
+app.mount("/", AuthSecMiddleware(mcp.streamable_http_app(), rt))
+
+
+if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
