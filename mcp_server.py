@@ -3,7 +3,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 
-mcp = FastMCP("Simple MCP Server")
+mcp = FastMCP("Simple MCP Server",transport_security={"enable_dns_rebinding_protection": False})
 
 @mcp.tool()
 def add_numbers(a: int, b: int) -> int:
