@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import Response
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
 from authsec_sdk import from_env, mount_mcp, ManifestTool, PolicyMode
+from authsec_sdk.runtime.metadata import build_resource_metadata_path, metadata_json_response
 import asyncio
 import os
 import uvicorn
@@ -102,9 +105,22 @@ cfg.tool_inventory_provider = tool_inventory
 cfg.tool_scopes = {"add_numbers": ["read"], "get_time": ["read"]}
 cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Fix 1: start FastMCP session manager so mcp_handler doesn't hang
+    async with mcp._session_manager.run():
+        yield
 
-# Registers /mcp (protected) and /.well-known/oauth-protected-resource/mcp
+
+app = FastAPI(lifespan=lifespan)
+
+# Fix 2: register metadata endpoint manually to avoid mount_mcp's _request bug
+@app.get(build_resource_metadata_path(cfg.resource_uri))
+async def metadata_endpoint(request: Request):
+    body, headers = metadata_json_response(cfg)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+# mount_mcp handles auth wrapping for /mcp
 mount_mcp(app, "/mcp", mcp_handler, cfg)
 
 
