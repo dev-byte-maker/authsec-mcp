@@ -1,20 +1,18 @@
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
 from authsec_sdk import from_env, mount_mcp, ManifestTool, PolicyMode
 from authsec_sdk.runtime.metadata import build_resource_metadata_path, metadata_json_response
-import asyncio
+import json
 import os
 import uvicorn
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── MCP tools ────────────────────────────────────────────────────────────────
+# ── MCP tools ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP("Simple MCP Server")
 
@@ -31,96 +29,101 @@ def get_time() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Bridge: converts FastMCP's ASGI app into a handler mount_mcp can use ─────
-
-mcp_asgi = mcp.streamable_http_app()
-
+# ── MCP handler using FastMCP's direct API (no ASGI bridge needed) ────────────
 
 async def mcp_handler(request: Request):
-    response_started = asyncio.Event()
-    status_code = [200]
-    resp_headers = [{}]
-    body_queue: asyncio.Queue = asyncio.Queue()
+    body = await request.body()
+    try:
+        msg = json.loads(body)
+    except json.JSONDecodeError as exc:
+        return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
 
-    async def send(message):
-        if message["type"] == "http.response.start":
-            status_code[0] = message["status"]
-            resp_headers[0] = {
-                k.decode(): v.decode()
-                for k, v in message.get("headers", [])
-            }
-            response_started.set()
-        elif message["type"] == "http.response.body":
-            await body_queue.put(
-                (message.get("body", b""), message.get("more_body", False))
-            )
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    params = msg.get("params") or {}
 
-    task = asyncio.create_task(mcp_asgi(request.scope, request.receive, send))
-    await response_started.wait()
-
-    async def body_stream():
-        while True:
-            chunk, more = await body_queue.get()
-            yield chunk
-            if not more:
-                break
-        await task
-
-    return StreamingResponse(
-        body_stream(),
-        status_code=status_code[0],
-        headers=resp_headers[0],
-    )
-
-
-# ── Tool inventory: tells AuthSec dashboard what tools exist ─────────────────
-
-def tool_inventory():
-    return [
-        ManifestTool(
-            name="add_numbers",
-            description="Add two integers and return the sum.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer"},
-                    "b": {"type": "integer"},
-                },
-                "required": ["a", "b"],
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "Simple MCP Server", "version": "1.0.0"},
             },
-            suggested_scopes=["read"],
-        ),
-        ManifestTool(
-            name="get_time",
-            description="Get the current server time (UTC, ISO 8601).",
-            input_schema={"type": "object", "properties": {}},
-            suggested_scopes=["read"],
-        ),
-    ]
-    
+        })
+
+    if method == "notifications/initialized":
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+
+    if method == "tools/list":
+        tools = await mcp.list_tools()
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.inputSchema,
+                    }
+                    for t in tools
+                ]
+            },
+        })
+
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        try:
+            result = await mcp.call_tool(tool_name, arguments)
+            content = [{"type": "text", "text": str(r)} for r in result] if isinstance(result, list) else [{"type": "text", "text": str(result)}]
+        except Exception as exc:
+            content = [{"type": "text", "text": str(exc)}]
+        return JSONResponse({"jsonrpc": "2.0", "id": msg_id, "result": {"content": content}})
+
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    })
+
+
+# ── AuthSec config ─────────────────────────────────────────────────────────────
 
 cfg = from_env()
 cfg.publish_manifest = True
-cfg.tool_inventory_provider = tool_inventory
-cfg.tool_scopes = {"add_numbers": ["read"], "get_time": ["read"]}
 cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
+cfg.tool_scopes = {"add_numbers": ["read"], "get_time": ["read"]}
+cfg.tool_inventory_provider = lambda: [
+    ManifestTool(
+        name="add_numbers",
+        description="Add two integers and return the sum.",
+        input_schema={
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        },
+        suggested_scopes=["read"],
+    ),
+    ManifestTool(
+        name="get_time",
+        description="Get the current server time (UTC, ISO 8601).",
+        input_schema={"type": "object", "properties": {}},
+        suggested_scopes=["read"],
+    ),
+]
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Fix 1: start FastMCP session manager so mcp_handler doesn't hang
-    async with mcp._session_manager.run():
-        yield
+app = FastAPI()
 
-
-app = FastAPI(lifespan=lifespan)
-
-# Fix 2: register metadata endpoint manually to avoid mount_mcp's _request bug
+# Fix: register metadata manually to avoid mount_mcp's _request parameter bug
 @app.get(build_resource_metadata_path(cfg.resource_uri))
 async def metadata_endpoint(request: Request):
     body, headers = metadata_json_response(cfg)
     return Response(content=body, media_type="application/json", headers=headers)
 
-# mount_mcp handles auth wrapping for /mcp
+# mount_mcp wraps mcp_handler with token validation
 mount_mcp(app, "/mcp", mcp_handler, cfg)
 
 
