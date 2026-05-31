@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from starlette.applications import Starlette
+from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
@@ -102,7 +102,7 @@ cfg.tool_inventory_provider = tool_inventory
 cfg.tool_scopes = {"add_numbers": ["read"], "get_time": ["read"]}
 cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
 
-app = Starlette()
+app = FastAPI()
 
 # Registers /mcp (protected) and /.well-known/oauth-protected-resource/mcp
 mount_mcp(app, "/mcp", mcp_handler, cfg)
