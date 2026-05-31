@@ -3,7 +3,8 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
-from authsec_sdk import from_env, mount_mcp
+from authsec_sdk import from_env, mount_mcp, ManifestTool
+from dataclasses import replace
 import asyncio
 import os
 import uvicorn
@@ -28,13 +29,12 @@ def get_time() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Bridge FastMCP's ASGI app to a Starlette route handler for mount_mcp ────
+# ── Bridge: converts FastMCP's ASGI app into a handler mount_mcp can use ─────
 
 mcp_asgi = mcp.streamable_http_app()
 
 
 async def mcp_handler(request: Request):
-    """Converts FastMCP's ASGI app into a handler compatible with mount_mcp."""
     response_started = asyncio.Event()
     status_code = [200]
     resp_headers = [{}]
@@ -71,14 +71,36 @@ async def mcp_handler(request: Request):
     )
 
 
-# ── App setup following the docs: from_env() + mount_mcp() ──────────────────
+# ── Tool inventory: tells AuthSec dashboard what tools exist ─────────────────
 
-cfg = from_env()
+def tool_inventory():
+    return [
+        ManifestTool(
+            name="add_numbers",
+            description="Add two integers and return the sum.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "b": {"type": "integer"},
+                },
+                "required": ["a", "b"],
+            },
+            suggested_scopes=["read"],
+        ),
+        ManifestTool(
+            name="get_time",
+            description="Get the current server time (UTC, ISO 8601).",
+            input_schema={"type": "object", "properties": {}},
+            suggested_scopes=["read"],
+        ),
+    ]
+    
 
+cfg = replace(from_env(), tool_inventory_provider=tool_inventory)
 app = Starlette()
 
-# mount_mcp registers /mcp (protected) and
-# /.well-known/oauth-protected-resource/mcp (RFC 9728 metadata) automatically
+# Registers /mcp (protected) and /.well-known/oauth-protected-resource/mcp
 mount_mcp(app, "/mcp", mcp_handler, cfg)
 
 
