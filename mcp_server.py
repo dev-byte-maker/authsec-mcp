@@ -117,14 +117,24 @@ cfg.tool_inventory_provider = lambda: [
 
 app = FastAPI()
 
-# Fix: register metadata manually to avoid mount_mcp's _request parameter bug
-@app.get(build_resource_metadata_path(cfg.resource_uri))
-async def metadata_endpoint(request: Request):
-    body, headers = metadata_json_response(cfg)
-    return Response(content=body, media_type="application/json", headers=headers)
 
-# mount_mcp wraps mcp_handler with token validation
-mount_mcp(app, "/mcp", mcp_handler, cfg)
+# _RouteProxy forces mount_mcp to use plain Starlette Route objects instead of
+# FastAPI's add_api_route — this avoids the _request parameter annotation bug
+# in FastAPI 0.136 that caused 502s on both /mcp and the metadata endpoint.
+class _RouteProxy:
+    def __init__(self, real: FastAPI) -> None:
+        self.routes = real.routes
+
+
+rt = mount_mcp(_RouteProxy(app), "/mcp", mcp_handler, cfg)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    try:
+        await rt.startup()
+    except Exception as exc:
+        print(f"[AuthSec] startup warning (non-fatal): {exc}")
 
 
 if __name__ == "__main__":
