@@ -3,8 +3,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
-from authsec_sdk import from_env, mount_mcp, ManifestTool
-from dataclasses import replace
+from authsec_sdk import from_env, mount_mcp, ManifestTool, PolicyMode
 import asyncio
 import os
 import uvicorn
@@ -97,7 +96,12 @@ def tool_inventory():
     ]
     
 
-cfg = replace(from_env(), tool_inventory_provider=tool_inventory)
+cfg = from_env()
+cfg.publish_manifest = True
+cfg.tool_inventory_provider = tool_inventory
+cfg.tool_scopes = {"add_numbers": ["read"], "get_time": ["read"]}
+cfg.policy_mode = PolicyMode.REMOTE_WITH_LOCAL_FALLBACK
+
 app = Starlette()
 
 # Registers /mcp (protected) and /.well-known/oauth-protected-resource/mcp
