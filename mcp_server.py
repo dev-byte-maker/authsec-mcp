@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
+from starlette.routing import Route
 import datetime
 from datetime import timezone
 from dotenv import load_dotenv
@@ -23,9 +24,5 @@ app = FastAPI()
 
 mcp_app = mcp.streamable_http_app()
 
-mount_mcp(
-    app,
-    "/mcp",
-    mcp_app,
-    cfg
-)
+
+mount_mcp(app, "/mcp", mcp_app, cfg)
