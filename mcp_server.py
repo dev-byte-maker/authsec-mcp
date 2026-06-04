@@ -5,6 +5,7 @@ import datetime
 from datetime import timezone
 from dotenv import load_dotenv
 from authsec_sdk import from_env, mount_mcp, ManifestTool
+import os
 
 load_dotenv()
 
@@ -51,3 +52,13 @@ mcp_app = mcp.streamable_http_app()
 
 
 mount_mcp(app, "/mcp", mcp_app, cfg)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+        log_level="info",
+    )
